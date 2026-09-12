@@ -2,6 +2,9 @@
 #include <WebServer.h>
 #include <ESP32Servo.h>
 #include <esp_wifi.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
@@ -12,7 +15,18 @@
 #define MQ2_PIN       34    // MQ-2 ADC Channel (Combustible Gases / Smoke)
 #define MQ135_PIN     35    // MQ-135 ADC Channel (Air Quality / CO2 / NH3)
 
+// --- Custom I2C Pins for OLED ---
+#define I2C_SDA       33
+#define I2C_SCL       32
+
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+
+Adafruit_SSD1306 oled(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 Servo ventServo;
+
+bool oledAvailable = false;
 
 // --- Access Point Credentials ---
 const char *AP_SSID = "EcoSense-AIoT";
@@ -21,11 +35,12 @@ const char *AP_PASS = "EcoSafe2026";
 WebServer server(80);
 
 // --- Tuning & Calibration Constants ---
-const int MQ2_MARGIN = 300;                     // Delta above baseline for gas hazard
-const int MQ135_MARGIN = 250;                   // Delta above baseline for AQI alert
-const int HYSTERESIS = 50;                      // Solid deadband buffer to stop rapid cycling
-const unsigned long SAMPLE_INTERVAL_MS = 100;   // 10 Hz telemetry loop
-const unsigned long WARMUP_DURATION_MS = 30000; // 30s thermal baseline acquisition
+const int MQ2_MARGIN = 300;
+const int MQ135_MARGIN = 250;
+const int HYSTERESIS = 50;
+const unsigned long SAMPLE_INTERVAL_MS = 100;
+const unsigned long WARMUP_DURATION_MS = 30000;
+const unsigned long OLED_REFRESH_MS = 250;
 
 // --- Dynamic Calibration & State Variables ---
 int liveMQ2 = 0, liveMQ135 = 0;
@@ -39,7 +54,7 @@ bool isAlarmMQ135 = false;
 bool currentHazardState = false;
 bool lastHazardState = false;
 
-// Staggered Actuation Timers (Prevents Current Surge)
+// Staggered Actuation Timers
 unsigned long hazardTriggerTimestamp = 0;
 bool pendingServoMove = false;
 
@@ -50,9 +65,9 @@ int currentServoAngle = SERVO_CLOSED_ANGLE;
 
 unsigned long lastSampleTime = 0;
 unsigned long lastBlinkTime = 0;
+unsigned long lastOledTime = 0;
 bool ledState = false;
 
-// 32-sample burst oversampling filter
 int getCleanADC(int pin) {
   long sum = 0;
   for (int i = 0; i < 32; i++) {
@@ -62,7 +77,118 @@ int getCleanADC(int pin) {
   return (int)(sum / 32);
 }
 
-// Modern Glassmorphism Dashboard UI
+// Visual HUD Engine for 128x64 OLED
+void updateOLEDDisplay() {
+  if (!oledAvailable) return;
+
+  oled.clearDisplay();
+
+  static bool flashToggle = false;
+  flashToggle = !flashToggle;
+
+  // --- 1. HEADER HUD BAR (Y: 0 to 11) ---
+  if (currentHazardState && flashToggle) {
+    oled.fillRect(0, 0, 128, 12, SSD1306_WHITE);
+    oled.setTextColor(SSD1306_BLACK);
+    oled.setTextSize(1);
+    oled.setCursor(8, 2);
+    oled.print("! HAZARD ALERT !");
+  } else {
+    oled.fillRect(0, 0, 128, 12, SSD1306_WHITE);
+    oled.setTextColor(SSD1306_BLACK);
+    oled.setTextSize(1);
+    oled.setCursor(3, 2);
+    oled.print("EcoSense AIoT");
+    oled.setCursor(94, 2);
+    oled.print(isWarmingUp ? "WARM" : (currentHazardState ? "ALRT" : "SAFE"));
+  }
+
+  // --- 2. MAIN CENTER BODY (Y: 15 to 42) ---
+  if (isWarmingUp) {
+    oled.setTextColor(SSD1306_WHITE);
+    oled.setTextSize(1);
+    oled.setCursor(18, 16);
+    oled.print("HEATER CALIBRATION");
+
+    // Centered Big Countdown Number
+    oled.setTextSize(2);
+    oled.setCursor(48, 27);
+    if (warmupSecondsLeft < 10) oled.print("0");
+    oled.print(warmupSecondsLeft);
+    oled.setTextSize(1);
+    oled.print("s");
+
+    // Rounded Progress Fill Bar
+    oled.drawRoundRect(14, 46, 100, 8, 2, SSD1306_WHITE);
+    int barW = map(constrain(30 - warmupSecondsLeft, 0, 30), 0, 30, 0, 96);
+    if (barW > 0) {
+      oled.fillRect(16, 48, barW, 4, SSD1306_WHITE);
+    }
+  } 
+  else {
+    oled.setTextColor(SSD1306_WHITE);
+
+    // Row 1: MQ-2 Gas Readout & Status
+    oled.setTextSize(1);
+    oled.setCursor(4, 16);
+    oled.print("GAS: ");
+    oled.setTextSize(1);
+    oled.print(liveMQ2);
+    oled.print(" / ");
+    oled.print(thrsMQ2);
+    if (isAlarmMQ2) {
+      oled.setCursor(102, 16);
+      oled.print("WARN");
+    }
+
+    // Row 2: MQ-135 Air Quality Readout & Status
+    oled.setCursor(4, 28);
+    oled.print("AQI: ");
+    oled.print(liveMQ135);
+    oled.print(" / ");
+    oled.print(thrsMQ135);
+    if (isAlarmMQ135) {
+      oled.setCursor(102, 28);
+      oled.print("POOR");
+    }
+
+    // Horizontal Divider
+    oled.drawFastHLine(0, 40, 128, SSD1306_WHITE);
+
+    // --- 3. BOTTOM ACTUATOR DECK (Y: 44 to 62) ---
+    // Fan Pill
+    if (currentHazardState) {
+      oled.fillRoundRect(2, 45, 60, 17, 3, SSD1306_WHITE);
+      oled.setTextColor(SSD1306_BLACK);
+      oled.setCursor(6, 50);
+      oled.print("FAN: ON");
+    } else {
+      oled.setTextColor(SSD1306_WHITE);
+      oled.drawRoundRect(2, 45, 60, 17, 3, SSD1306_WHITE);
+      oled.setCursor(6, 50);
+      oled.print("FAN: OFF");
+    }
+
+    // Vent Valve Pill
+    if (currentServoAngle > 0) {
+      oled.fillRoundRect(66, 45, 60, 17, 3, SSD1306_WHITE);
+      oled.setTextColor(SSD1306_BLACK);
+      oled.setCursor(70, 50);
+      oled.print("VENT: 90");
+      oled.print((char)247);
+    } else {
+      oled.setTextColor(SSD1306_WHITE);
+      oled.drawRoundRect(66, 45, 60, 17, 3, SSD1306_WHITE);
+      oled.setCursor(70, 50);
+      oled.print("VENT:  0");
+      oled.print((char)247);
+    }
+  }
+
+  oled.display();
+}
+
+// Complete Responsive Glassmorphism Mobile Dashboard
 const char PAGE_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -70,7 +196,6 @@ const char PAGE_HTML[] PROGMEM = R"rawliteral(
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
   <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="theme-color" content="#030712">
   <title>EcoSense AIoT Safety Station</title>
   <style>
@@ -97,10 +222,9 @@ const char PAGE_HTML[] PROGMEM = R"rawliteral(
       --accent-indigo: #6366f1;
       --chart-bg: #e5e7eb;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; -webkit-tap-highlight-color: transparent; }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; -webkit-tap-highlight-color: transparent; }
     body { background: var(--bg); color: var(--text-main); display: flex; justify-content: center; min-height: 100vh; padding: 16px; transition: background 0.3s ease; }
     .hub-container { width: 100%; max-width: 440px; display: flex; flex-direction: column; gap: 14px; }
-    
     .nav-bar { display: flex; justify-content: space-between; align-items: center; padding: 6px 2px; }
     .brand { display: flex; align-items: center; gap: 8px; }
     .brand-icon { width: 12px; height: 12px; border-radius: 50%; background: var(--accent-cyan); box-shadow: 0 0 10px var(--accent-cyan); }
@@ -134,23 +258,23 @@ const char PAGE_HTML[] PROGMEM = R"rawliteral(
     .chart-legend { display: flex; gap: 12px; font-size: 0.7rem; font-weight: 700; }
     canvas { width: 100%; height: 110px; background: var(--chart-bg); border-radius: 12px; display: block; }
 
-    .stream-box { padding: 14px; }
-    .stream-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-    .export-link { background: none; border: none; color: var(--accent-cyan); font-size: 0.72rem; font-weight: 700; cursor: pointer; text-decoration: underline; }
-    #eventStream { height: 75px; overflow-y: auto; display: flex; flex-direction: column-reverse; gap: 4px; font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.7rem; }
-    .stream-row { padding-bottom: 3px; border-bottom: 1px solid var(--card-border); }
-    .stream-alert { color: var(--danger); font-weight: bold; }
-    .stream-ok { color: var(--success); }
-    .stream-info { color: var(--accent-cyan); }
+    .log-card { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 22px; padding: 14px; }
+    .log-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .log-title { font-size: 0.72rem; font-weight: 700; color: var(--text-sub); text-transform: uppercase; letter-spacing: 0.5px; }
+    .export-btn { background: transparent; border: 1px solid var(--card-border); color: var(--accent-cyan); padding: 3px 8px; border-radius: 6px; font-size: 0.7rem; font-weight: 700; cursor: pointer; }
+    #logContainer { height: 85px; overflow-y: auto; font-family: monospace; font-size: 0.72rem; color: var(--text-main); display: flex; flex-direction: column-reverse; gap: 3px; }
+    .log-entry { border-bottom: 1px solid var(--card-border); padding-bottom: 2px; }
+    .log-alert { color: var(--danger); font-weight: bold; }
+    .log-safe { color: var(--success); }
 
     .action-row { display: flex; gap: 10px; }
     .btn-action { width: 100%; padding: 14px; border-radius: 18px; font-size: 0.85rem; font-weight: 700; border: none; cursor: pointer; transition: transform 0.1s ease; }
     .btn-action:active { transform: scale(0.98); }
     .btn-arm { background: linear-gradient(135deg, var(--accent-cyan), var(--accent-indigo)); color: #030712; }
     .btn-mute { background: rgba(239, 68, 68, 0.2); color: var(--danger); border: 1px solid rgba(239, 68, 68, 0.4); display: none; }
-    .btn-muted-active { background: var(--card-bg); color: var(--text-sub); border-color: var(--card-border); }
+    .btn-muted-state { background: var(--card-bg); color: var(--text-sub); border-color: var(--card-border); }
 
-    @keyframes pulseAlert { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.85; transform: scale(0.995); } }
+    @keyframes pulseAlert { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.85; } }
   </style>
 </head>
 <body>
@@ -208,102 +332,99 @@ const char PAGE_HTML[] PROGMEM = R"rawliteral(
           <span style="color:var(--accent-indigo);">&#9632; MQ-135</span>
         </div>
       </div>
-      <canvas id="telemetryCanvas" width="380" height="110"></canvas>
+      <canvas id="liveChart" width="380" height="110"></canvas>
     </div>
 
-    <div class="card stream-box">
-      <div class="stream-head">
-        <div class="card-label" style="margin:0;">Event Stream</div>
-        <button class="export-link" onclick="downloadCSV()">Export CSV</button>
+    <div class="log-card">
+      <div class="log-header">
+        <span class="log-title">System Event Stream</span>
+        <button class="export-btn" onclick="exportCSV()">Download CSV</button>
       </div>
-      <div id="eventStream">
-        <div class="stream-row stream-info">Telemetry link connected...</div>
+      <div id="logContainer">
+        <div class="log-entry log-safe">Stabilizing sensors on startup...</div>
       </div>
     </div>
 
     <div class="action-row">
-      <button id="armBtn" class="btn-action btn-arm" onclick="armPhoneAudio()">Tap to Arm Siren Alert</button>
-      <button id="muteBtn" class="btn-action btn-mute" onclick="toggleAudioMute()">Mute Siren</button>
+      <button id="audioBtn" class="btn-action btn-arm" onclick="initAudio()">Tap to Enable Siren</button>
+      <button id="muteBtn" class="btn-action btn-mute" onclick="toggleMute()">Mute Siren</button>
     </div>
   </div>
 
   <script>
     let audioCtx = null, sirenOsc = null, lfoOsc = null, gainNode = null;
     let isMuted = false;
-    let hadHazard = false;
-    let isLight = false;
-    let warmupLogged = false;
-    const mq2Log = new Array(50).fill(0);
-    const mq135Log = new Array(50).fill(0);
-    const telemetryRecords = [];
+    let lastStateWasAlarm = false;
+    let isLightMode = false;
+    let lastLoggedWarmupSec = -1;
+    const historyMQ2 = new Array(50).fill(0);
+    const historyMQ135 = new Array(50).fill(0);
+    const csvRecords = [];
 
-    const canvas = document.getElementById('telemetryCanvas');
+    const canvas = document.getElementById('liveChart');
     const ctx = canvas.getContext('2d');
 
     function toggleTheme() {
-      isLight = !isLight;
-      document.body.classList.toggle('light-theme', isLight);
-      document.getElementById('themeBtn').innerText = isLight ? 'Dark' : 'Light';
-      renderChart();
+      isLightMode = !isLightMode;
+      document.body.classList.toggle('light-theme', isLightMode);
+      document.getElementById('themeBtn').innerText = isLightMode ? 'Dark' : 'Light';
+      drawChart();
     }
 
-    function armPhoneAudio() {
+    function initAudio() {
       if (!audioCtx) {
         audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        document.getElementById('armBtn').style.display = 'none';
+        document.getElementById('audioBtn').style.display = 'none';
         document.getElementById('muteBtn').style.display = 'block';
-        pushEvent('Phone audio siren armed', 'info');
+        addLog('Audio alarm system armed & listening', false);
       }
     }
 
-    function toggleAudioMute() {
+    function toggleMute() {
       isMuted = !isMuted;
-      const btn = document.getElementById('muteBtn');
+      const mBtn = document.getElementById('muteBtn');
       if (isMuted) {
-        btn.innerText = 'Unmute Siren';
-        btn.classList.add('btn-muted-active');
+        mBtn.innerText = 'Unmute Siren';
+        mBtn.className = 'btn-action btn-mute btn-muted-state';
         stopSiren();
-        pushEvent('Siren muted by user', 'info');
+        addLog('Audio alarm muted manually', false);
       } else {
-        btn.innerText = 'Mute Siren';
-        btn.classList.remove('btn-muted-active');
-        pushEvent('Siren unmuted', 'info');
+        mBtn.innerText = 'Mute Siren';
+        mBtn.className = 'btn-action btn-mute';
+        addLog('Audio alarm unmuted', false);
       }
     }
 
-    function pushEvent(msg, type) {
-      const stream = document.getElementById('eventStream');
+    function addLog(msg, isAlert) {
+      const container = document.getElementById('logContainer');
       const time = new Date().toLocaleTimeString();
       const div = document.createElement('div');
-      let typeClass = 'stream-ok';
-      if (type === 'alert') typeClass = 'stream-alert';
-      else if (type === 'info') typeClass = 'stream-info';
-      div.className = 'stream-row ' + typeClass;
+      div.className = 'log-entry ' + (isAlert ? 'log-alert' : 'log-safe');
       div.innerText = '[' + time + '] ' + msg;
-      stream.prepend(div);
-      if (stream.children.length > 25) stream.removeChild(stream.lastChild);
+      container.prepend(div);
+      if (container.children.length > 25) container.removeChild(container.lastChild);
     }
 
-    function downloadCSV() {
-      if (!telemetryRecords.length) return alert('Collecting data...');
-      let csv = 'Timestamp,MQ2_Raw,MQ2_Base,MQ2_Thrs,MQ135_Raw,MQ135_Base,MQ135_Thrs,Vent_Angle,Hazard_State\n';
-      telemetryRecords.forEach(r => {
-        csv += `${r.t},${r.m2},${r.m2b},${r.m2t},${r.m135},${r.m135b},${r.m135t},${r.ang},${r.hz}\n`;
+    function exportCSV() {
+      if (csvRecords.length === 0) { alert('No telemetry recorded yet.'); return; }
+      let csvContent = 'data:text/csv;charset=utf-8,Timestamp,MQ2_Raw,MQ2_Base,MQ2_Thrs,MQ135_Raw,MQ135_Base,MQ135_Thrs,Vent_Angle,Alarm_State\n';
+      csvRecords.forEach(r => {
+        csvContent += `${r.t},${r.mq2},${r.mq2_b},${r.mq2_t},${r.mq135},${r.mq135_b},${r.mq135_t},${r.ang},${r.alm}\n`;
       });
-      const a = document.createElement('a');
-      a.href = 'data:text/csv;charset=utf-8,' + encodeURI(csv);
-      a.download = `ecosense_hub_${Date.now()}.csv`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
+      const link = document.createElement('a');
+      link.setAttribute('href', encodeURI(csvContent));
+      link.setAttribute('download', `ecosense_telemetry_${Date.now()}.csv`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
     }
 
-    function triggerSiren(active, ratio) {
+    function setSiren(play, freqRatio) {
       if (!audioCtx || isMuted) {
         if (isMuted) stopSiren();
         return;
       }
-      if (active) {
+      if (play) {
         if (!sirenOsc) {
           sirenOsc = audioCtx.createOscillator();
           lfoOsc = audioCtx.createOscillator();
@@ -312,13 +433,11 @@ const char PAGE_HTML[] PROGMEM = R"rawliteral(
 
           sirenOsc.type = 'sawtooth';
           lfoOsc.type = 'sine';
-
           lfoOsc.frequency.setValueAtTime(2.5, audioCtx.currentTime);
           lfoGain.gain.setValueAtTime(280, audioCtx.currentTime);
 
           lfoOsc.connect(lfoGain);
           lfoGain.connect(sirenOsc.frequency);
-
           sirenOsc.connect(gainNode);
           gainNode.connect(audioCtx.destination);
           gainNode.gain.setValueAtTime(0.25, audioCtx.currentTime);
@@ -326,8 +445,8 @@ const char PAGE_HTML[] PROGMEM = R"rawliteral(
           sirenOsc.start();
           lfoOsc.start();
         }
-        let baseFreq = 650 + (ratio * 400);
-        sirenOsc.frequency.setTargetAtTime(baseFreq, audioCtx.currentTime, 0.05);
+        let targetFreq = 650 + (freqRatio * 400);
+        sirenOsc.frequency.setTargetAtTime(targetFreq, audioCtx.currentTime, 0.05);
       } else {
         stopSiren();
       }
@@ -346,34 +465,37 @@ const char PAGE_HTML[] PROGMEM = R"rawliteral(
       }
     }
 
-    function renderChart() {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.strokeStyle = isLight ? 'rgba(0,0,0,0.06)' : 'rgba(255,255,255,0.06)';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(0, canvas.height / 2);
-      ctx.lineTo(canvas.width, canvas.height / 2);
-      ctx.stroke();
-
-      function drawTrace(arr, col) {
-        ctx.strokeStyle = col;
-        ctx.lineWidth = 2;
+    function drawChart() {
+      try {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.strokeStyle = isLightMode ? 'rgba(0,0,0,0.06)' : 'rgba(255,255,255,0.06)';
+        ctx.lineWidth = 1;
         ctx.beginPath();
-        for (let i = 0; i < arr.length; i++) {
-          let x = (i / (arr.length - 1)) * canvas.width;
-          let y = canvas.height - ((arr[i] / 4095) * (canvas.height - 10)) - 5;
-          if (i === 0) ctx.moveTo(x, y);
-          else ctx.lineTo(x, y);
-        }
+        ctx.moveTo(0, canvas.height / 2);
+        ctx.lineTo(canvas.width, canvas.height / 2);
         ctx.stroke();
-      }
 
-      drawTrace(mq2Log, isLight ? '#0891b2' : '#06b6d4');
-      drawTrace(mq135Log, isLight ? '#6366f1' : '#818cf8');
+        function plotLine(arr, color) {
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          for (let i = 0; i < arr.length; i++) {
+            let x = (i / (arr.length - 1)) * canvas.width;
+            let y = canvas.height - ((arr[i] / 4095) * (canvas.height - 10)) - 5;
+            if (i === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+        }
+
+        plotLine(historyMQ2, isLightMode ? '#0891b2' : '#06b6d4');
+        plotLine(historyMQ135, isLightMode ? '#6366f1' : '#818cf8');
+      } catch(e) {}
     }
 
     setInterval(() => {
       fetch('/data').then(r => r.json()).then(d => {
+        // Safe DOM Updates
         document.getElementById('valMQ2').innerText = d.mq2;
         document.getElementById('baseMQ2').innerText = d.mq2_b;
         document.getElementById('thrsMQ2').innerText = d.mq2_t;
@@ -382,20 +504,9 @@ const char PAGE_HTML[] PROGMEM = R"rawliteral(
         document.getElementById('baseMQ135').innerText = d.mq135_b;
         document.getElementById('thrsMQ135').innerText = d.mq135_t;
 
-        mq2Log.push(d.mq2); mq2Log.shift();
-        mq135Log.push(d.mq135); mq135Log.shift();
-        renderChart();
-
-        if (!d.warmup) {
-          telemetryRecords.push({
-            t: new Date().toLocaleTimeString(),
-            m2: d.mq2, m2b: d.mq2_b, m2t: d.mq2_t,
-            m135: d.mq135, m135b: d.mq135_b, m135t: d.mq135_t,
-            ang: d.servo_ang,
-            hz: (d.al_mq2 || d.al_mq135) ? 1 : 0
-          });
-          if (telemetryRecords.length > 300) telemetryRecords.shift();
-        }
+        historyMQ2.push(d.mq2); historyMQ2.shift();
+        historyMQ135.push(d.mq135); historyMQ135.shift();
+        drawChart();
 
         const badge = document.getElementById('statusBadge');
         const statusText = document.getElementById('statusText');
@@ -415,29 +526,44 @@ const char PAGE_HTML[] PROGMEM = R"rawliteral(
           pillFan.className = 'pill pill-idle';
           pillVent.className = 'pill pill-idle';
           labelVent.innerText = 'Vent: CLOSED (' + d.servo_ang + '°)';
-          triggerSiren(false, 0);
+          setSiren(false, 0);
+
+          if (d.left % 10 === 0 && d.left !== lastLoggedWarmupSec) {
+            addLog('Sensors stabilizing... ' + d.left + 's remaining', false);
+            lastLoggedWarmupSec = d.left;
+          }
         } else {
           warmupBarContainer.style.display = 'none';
 
-          if (!warmupLogged) {
-            pushEvent('Sensors armed and baseline established', 'info');
-            warmupLogged = true;
+          if (lastLoggedWarmupSec !== 0) {
+            addLog('Heater warmup complete. Baselines locked.', false);
+            lastLoggedWarmupSec = 0;
           }
+
+          // CSV Telemetry Record
+          csvRecords.push({
+            t: new Date().toLocaleTimeString(),
+            mq2: d.mq2, mq2_b: d.mq2_b, mq2_t: d.mq2_t,
+            mq135: d.mq135, mq135_b: d.mq135_b, mq135_t: d.mq135_t,
+            ang: d.servo_ang,
+            alm: (d.al_mq2 || d.al_mq135) ? 1 : 0
+          });
+          if (csvRecords.length > 500) csvRecords.shift();
 
           if (d.al_mq2 || d.al_mq135) {
             badge.className = 'status-panel status-hazard';
-            statusText.innerText = d.al_mq2 ? 'HAZARD: COMBUSTIBLE GAS DETECTED' : 'WARNING: AIR CONTAMINATION';
+            statusText.innerText = d.al_mq2 ? 'HAZARD: COMBUSTIBLE GAS DETECTED' : 'WARNING: CONTAMINATED AIR';
             pillFan.className = 'pill pill-active';
             pillVent.className = 'pill pill-active';
             labelVent.innerText = 'Vent: OPEN (' + d.servo_ang + '°)';
 
             let ratio = d.al_mq2 ? (d.mq2 - d.mq2_t) / (4095 - d.mq2_t) : (d.mq135 - d.mq135_t) / (4095 - d.mq135_t);
-            triggerSiren(true, Math.min(Math.max(ratio, 0), 1));
+            setSiren(true, Math.min(Math.max(ratio, 0), 1));
 
-            if (!hadHazard) {
-              pushEvent(d.al_mq2 ? 'MQ-2 Gas spike threshold breached' : 'MQ-135 Air contamination breached', 'alert');
-              pushEvent('Actuators fired: Relay ON, Vent OPEN (' + d.servo_ang + '°)', 'info');
-              hadHazard = true;
+            if (!lastStateWasAlarm) {
+              addLog(d.al_mq2 ? 'MQ-2 Gas spike threshold breached!' : 'MQ-135 Air contamination breached!', true);
+              addLog('Actuators triggered: Relay ON, Vent OPEN (' + d.servo_ang + '°)', true);
+              lastStateWasAlarm = true;
             }
           } else {
             badge.className = 'status-panel status-normal';
@@ -445,12 +571,12 @@ const char PAGE_HTML[] PROGMEM = R"rawliteral(
             pillFan.className = 'pill pill-idle';
             pillVent.className = 'pill pill-idle';
             labelVent.innerText = 'Vent: CLOSED (' + d.servo_ang + '°)';
-            triggerSiren(false, 0);
+            setSiren(false, 0);
 
-            if (hadHazard) {
-              pushEvent('Atmosphere returned to safe baseline', 'ok');
-              pushEvent('Actuators idle: Relay OFF, Vent CLOSED (' + d.servo_ang + '°)', 'info');
-              hadHazard = false;
+            if (lastStateWasAlarm) {
+              addLog('Atmosphere normalized back below thresholds', false);
+              addLog('Actuators idle: Relay OFF, Vent CLOSED (' + d.servo_ang + '°)', false);
+              lastStateWasAlarm = false;
             }
           }
         }
@@ -481,7 +607,6 @@ void handleData() {
 }
 
 void setup() {
-  // Disable brownout detector to prevent sudden resets during relay/servo spikes
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
   Serial.begin(115200);
@@ -493,7 +618,36 @@ void setup() {
   digitalWrite(LED_PIN, HIGH);
   digitalWrite(RELAY_PIN, LOW);
 
-  // Configure continuous full-power Wi-Fi AP
+  // Enable internal pullups & configure stable 100 kHz I2C clock
+  pinMode(I2C_SDA, INPUT_PULLUP);
+  pinMode(I2C_SCL, INPUT_PULLUP);
+  Wire.begin(I2C_SDA, I2C_SCL, 100000);
+  Wire.setTimeOut(50);
+
+  // Auto-probe OLED addresses
+  if (oled.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    oledAvailable = true;
+    Serial.println(F("[OLED] Display verified at address 0x3C"));
+  } else if (oled.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {
+    oledAvailable = true;
+    Serial.println(F("[OLED] Display verified at address 0x3D"));
+  } else {
+    oledAvailable = false;
+    Serial.println(F("[OLED] Warning: Screen not detected on GPIO 33/32. Running headless."));
+  }
+
+  if (oledAvailable) {
+    oled.clearDisplay();
+    oled.setTextColor(SSD1306_WHITE);
+    oled.setTextSize(1);
+    oled.setCursor(16, 20);
+    oled.println(F("EcoSense AIoT Hub"));
+    oled.setCursor(24, 38);
+    oled.println(F("SYSTEM ONLINE"));
+    oled.display();
+  }
+
+  // Continuous Full-Power Wi-Fi SoftAP
   WiFi.disconnect(true);
   WiFi.mode(WIFI_AP);
   delay(100);
@@ -501,7 +655,7 @@ void setup() {
   WiFi.setSleep(false);
   esp_wifi_set_ps(WIFI_PS_NONE);
 
-  // Servo Timer Allocation
+  // Servo Setup
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
   ESP32PWM::allocateTimer(2);
@@ -509,22 +663,19 @@ void setup() {
   ventServo.setPeriodHertz(50);
   ventServo.attach(SERVO_PIN, 500, 2400);
 
-  // Initialize Servo cleanly at 0 degrees
   currentServoAngle = SERVO_CLOSED_ANGLE;
   ventServo.write(currentServoAngle);
 
-  // ADC Attenuation
   analogSetPinAttenuation(MQ2_PIN, ADC_11db);
   analogSetPinAttenuation(MQ135_PIN, ADC_11db);
 
-  Serial.println("\n==========================================");
-  Serial.println("     EcoSense AIoT Safety Station Hub     ");
-  Serial.println("==========================================");
-  Serial.print("Access Point:  ");
-  Serial.println(AP_SSID);
-  Serial.print("Dashboard URL: http://");
-  Serial.println(WiFi.softAPIP());
-  Serial.println("------------------------------------------");
+  Serial.println(F("\n=========================================="));
+  Serial.println(F("     EcoSense AIoT Safety Station Hub     "));
+  Serial.println(F("=========================================="));
+  Serial.print(F("Access Point : ")); Serial.println(AP_SSID);
+  Serial.print(F("Dashboard URL: http://")); Serial.println(WiFi.softAPIP());
+  Serial.println(F("Telemetry Serial Stream Active (115200 Baud)"));
+  Serial.println(F("------------------------------------------"));
 
   server.on("/", handleRoot);
   server.on("/data", handleData);
@@ -535,7 +686,7 @@ void loop() {
   server.handleClient();
   unsigned long currentMillis = millis();
 
-  // 30-Second Thermal Stabilization
+  // 30-Second Thermal Stabilization Routine
   if (isWarmingUp) {
     if (currentMillis < WARMUP_DURATION_MS) {
       warmupSecondsLeft = (int)((WARMUP_DURATION_MS - currentMillis) / 1000) + 1;
@@ -547,7 +698,7 @@ void loop() {
       baseMQ135 = (float)liveMQ135;
       thrsMQ2 = (int)baseMQ2 + MQ2_MARGIN;
       thrsMQ135 = (int)baseMQ135 + MQ135_MARGIN;
-      Serial.println("\n>>> SENSORS STABILIZED: BASELINES LOCKED <<<");
+      Serial.println(F("\n>>> [CALIBRATION COMPLETE] Ambient baselines locked. System armed. <<<"));
     }
   }
 
@@ -559,7 +710,7 @@ void loop() {
     liveMQ135 = getCleanADC(MQ135_PIN);
 
     if (!isWarmingUp) {
-      // Clean air adaptive baseline drift tracking
+      // Dynamic baseline drift tracking during normal air
       if (!isAlarmMQ2 && liveMQ2 > 20) {
         baseMQ2 = (0.99 * baseMQ2) + (0.01 * liveMQ2);
         thrsMQ2 = (int)baseMQ2 + MQ2_MARGIN;
@@ -569,7 +720,7 @@ void loop() {
         thrsMQ135 = (int)baseMQ135 + MQ135_MARGIN;
       }
 
-      // Hysteresis threshold logic
+      // Hysteresis threshold comparison
       if (!isAlarmMQ2 && liveMQ2 > thrsMQ2) isAlarmMQ2 = true;
       else if (isAlarmMQ2 && liveMQ2 < (thrsMQ2 - HYSTERESIS)) isAlarmMQ2 = false;
 
@@ -579,39 +730,44 @@ void loop() {
 
     currentHazardState = (isAlarmMQ2 || isAlarmMQ135);
 
-    // Staggered Actuation Logic (Splits Power Draw)
+    // Staggered Actuation Logic
     if (currentHazardState != lastHazardState) {
       if (currentHazardState) {
         digitalWrite(RELAY_PIN, HIGH);
         hazardTriggerTimestamp = currentMillis;
         pendingServoMove = true;
-        Serial.println(">>> HAZARD TRIGGERED: RELAY ON (SERVO DELAYED 250ms) <<<");
+        Serial.println(F(">>> [EVENT: ALARM] Relay ON. Servo vent move queued (+250ms). <<<"));
       } else {
         digitalWrite(RELAY_PIN, LOW);
         currentServoAngle = SERVO_CLOSED_ANGLE;
         ventServo.write(currentServoAngle);
         pendingServoMove = false;
-        Serial.println(">>> HAZARD CLEARED: RELAY OFF & SERVO CLOSED <<<");
+        Serial.println(F(">>> [EVENT: SAFE] Atmosphere normal. Relay OFF, Vent 0 deg. <<<"));
       }
       lastHazardState = currentHazardState;
     }
 
-    // Execute delayed servo rotation after relay inrush settles
     if (pendingServoMove && (currentMillis - hazardTriggerTimestamp >= 250)) {
       currentServoAngle = SERVO_OPEN_ANGLE;
       ventServo.write(currentServoAngle);
       pendingServoMove = false;
-      Serial.println(">>> SERVO OPENED (90 DEG) <<<");
+      Serial.println(F(">>> [ACTUATOR] Servo Vent Flap rotated to 90 deg. <<<"));
     }
 
-    // Serial Telemetry
+    // Continuous Telemetry Output for Arduino Serial Plotter & Monitor
     Serial.print("MQ2:"); Serial.print(liveMQ2);
-    Serial.print("\tMQ2_Thrs:"); Serial.print(thrsMQ2);
-    Serial.print("\tMQ135:"); Serial.print(liveMQ135);
-    Serial.print("\tMQ135_Thrs:"); Serial.print(thrsMQ135);
-    Serial.print("\tServo_Angle:"); Serial.print(currentServoAngle);
-    Serial.print("\tWarmup_Left:"); Serial.print(isWarmingUp ? warmupSecondsLeft : 0);
-    Serial.print("\tHazard:"); Serial.println(currentHazardState ? 1 : 0);
+    Serial.print(" MQ2_Thrs:"); Serial.print(thrsMQ2);
+    Serial.print(" MQ135:"); Serial.print(liveMQ135);
+    Serial.print(" MQ135_Thrs:"); Serial.print(thrsMQ135);
+    Serial.print(" Vent_Angle:"); Serial.print(currentServoAngle);
+    Serial.print(" Warmup_Left:"); Serial.print(isWarmingUp ? warmupSecondsLeft : 0);
+    Serial.print(" Alarm:"); Serial.println(currentHazardState ? 1 : 0);
+  }
+
+  // Refresh OLED Display at 4 Hz
+  if (currentMillis - lastOledTime >= OLED_REFRESH_MS) {
+    lastOledTime = currentMillis;
+    updateOLEDDisplay();
   }
 
   // Diagnostic Status LED Heartbeat
